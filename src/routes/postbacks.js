@@ -26,6 +26,13 @@ function makeTheoremReachHash(urlBeforeHash, secretKey) {
   );
 }
 
+function makeBitLabsHash(urlBeforeHash, secretKey) {
+  return crypto
+    .createHmac('sha1', secretKey)
+    .update(urlBeforeHash)
+    .digest('hex');
+}
+
 function stripHashFromUrl(url) {
   return String(url || '')
     .replace(/([?&])hash=[^&]*&?/, '$1')
@@ -65,6 +72,170 @@ function verifyTheoremReachHash(req) {
     const expectedHash = makeTheoremReachHash(urlBeforeHash, secretKey);
     return constantEqual(receivedHash, expectedHash);
   });
+}
+
+function verifyBitLabsHash(req) {
+  const secretKey = process.env.BITLABS_SECRET_KEY;
+  const receivedHash = req.query.hash;
+
+  if (!secretKey || !receivedHash) return false;
+
+  return getPossiblePublicUrls(req).some((urlBeforeHash) => {
+    const expectedHash = makeBitLabsHash(urlBeforeHash, secretKey);
+    return constantEqual(
+      String(receivedHash).toLowerCase(),
+      String(expectedHash).toLowerCase()
+    );
+  });
+}
+
+function firstValue(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== '');
+}
+
+function parseBitLabsPostback(query) {
+  const transactionId = firstValue(
+    query.tx,
+    query.TX,
+    query.transaction_id,
+    query.transactionId,
+    query.transaction,
+    query.ref,
+    query.REF
+  );
+
+  const userId = firstValue(
+    query.uid,
+    query.UID,
+    query.user_id,
+    query.userId,
+    query.external_id,
+    query.subid,
+    query.sub_id
+  );
+
+  const reward = firstValue(
+    query.reward,
+    query.val,
+    query.VAL,
+    query.value,
+    query.VALUE,
+    query.currency_value,
+    query.CURRENCY_VALUE,
+    query.points,
+    query.amount
+  );
+
+  const usd = firstValue(
+    query.usd,
+    query.USD,
+    query.value_usd,
+    query.VALUE_USD,
+    query.payout
+  );
+
+  const type = String(
+    firstValue(query.type, query.TYPE, query.status, query.STATUS, 'COMPLETE')
+  ).toUpperCase();
+
+  const isReversal =
+    type.includes('RECONCILIATION') ||
+    type.includes('REVERSE') ||
+    type.includes('REVERSED') ||
+    type.includes('CHARGEBACK') ||
+    Number(reward) < 0;
+
+  return {
+    transactionId,
+    userId,
+    reward,
+    usd,
+    type,
+    isReversal,
+  };
+}
+
+async function reverseReward({
+  client,
+  provider,
+  transactionId,
+  rawData,
+  fallbackAmount,
+}) {
+  await client.query('BEGIN');
+
+  const existing = await client.query(
+    'SELECT id, user_id, reward, status FROM offerwall_postbacks WHERE transaction_id = $1',
+    [transactionId]
+  );
+
+  if (existing.rows.length === 0) {
+    await client.query('ROLLBACK');
+    return { ignored: true, reason: 'original_not_found' };
+  }
+
+  const existingPostback = existing.rows[0];
+
+  if (existingPostback.status === 'reversed') {
+    await client.query('ROLLBACK');
+    return { ignored: true, reason: 'already_reversed' };
+  }
+
+  const reverseAmount = Math.abs(
+    Number(existingPostback.reward || fallbackAmount || 0)
+  );
+
+  await client.query(
+    `UPDATE offerwall_postbacks
+     SET status = $1, raw_data = $2
+     WHERE transaction_id = $3`,
+    ['reversed', JSON.stringify(rawData || {}), transactionId]
+  );
+
+  await client.query(
+    `UPDATE users
+     SET balance = GREATEST(COALESCE(balance, 0) - $1, 0),
+         total_earned = GREATEST(COALESCE(total_earned, 0) - $1, 0),
+         updated_at = NOW()
+     WHERE id = $2`,
+    [reverseAmount, existingPostback.user_id]
+  );
+
+  await client.query(
+    `INSERT INTO transactions
+     (user_id, type, amount, description, reference_type, external_transaction_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      existingPostback.user_id,
+      'offer_reversal',
+      -reverseAmount,
+      `${provider.toUpperCase()} reward reversed`,
+      provider === 'bitlabs' ? 'survey' : 'offerwall',
+      transactionId,
+    ]
+  );
+
+  try {
+    await client.query(
+      `INSERT INTO notifications (user_id, title, message, type)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        existingPostback.user_id,
+        'Reward reversed',
+        `${reverseAmount} Coins from ${provider} were reversed.`,
+        'warning',
+      ]
+    );
+  } catch (notificationError) {
+    console.error(`${provider} reverse notification skipped:`, notificationError.message);
+  }
+
+  await client.query('COMMIT');
+
+  return {
+    ignored: false,
+    reversed: reverseAmount,
+  };
 }
 
 async function creditReward({
@@ -180,9 +351,6 @@ router.get('/theoremreach', async (req, res) => {
       });
     }
 
-    // TEMPORARY FIX:
-    // Default true so Railway/proxy hash mismatch does not block callbacks.
-    // After TheoremReach is fully live, set THEOREMREACH_SKIP_HASH=false.
     const skipHash = boolEnv('THEOREMREACH_SKIP_HASH', true);
     const hashOk = skipHash || verifyTheoremReachHash(req);
 
@@ -190,7 +358,8 @@ router.get('/theoremreach', async (req, res) => {
       return res.status(403).json({
         error: 'Invalid TheoremReach hash',
         received: req.query,
-        hint: 'Set PUBLIC_API_URL=https://earnably-api-production.up.railway.app or temporarily set THEOREMREACH_SKIP_HASH=true.',
+        hint:
+          'Set PUBLIC_API_URL=https://earnably-api-production.up.railway.app or temporarily set THEOREMREACH_SKIP_HASH=true.',
       });
     }
 
@@ -255,6 +424,121 @@ router.get('/theoremreach', async (req, res) => {
   }
 });
 
+router.get('/bitlabs', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    console.log('BITLABS CALLBACK RECEIVED:', req.query);
+
+    const parsed = parseBitLabsPostback(req.query);
+    const { transactionId, userId, reward, usd, type, isReversal } = parsed;
+
+    if (!transactionId || !userId || reward === undefined) {
+      return res.status(400).json({
+        error: 'Invalid BitLabs postback data',
+        required: ['uid', 'tx', 'reward'],
+        received: req.query,
+      });
+    }
+
+    const skipHash = boolEnv('BITLABS_SKIP_HASH', true);
+    const hashOk = skipHash || verifyBitLabsHash(req);
+
+    if (!hashOk) {
+      return res.status(403).json({
+        error: 'Invalid BitLabs hash',
+        received: req.query,
+        hint:
+          'Set PUBLIC_API_URL=https://earnably-api-production.up.railway.app or temporarily set BITLABS_SKIP_HASH=true.',
+      });
+    }
+
+    const amount = Math.abs(Number(reward));
+
+    if (isReversal) {
+      const reverseResult = await reverseReward({
+        client,
+        provider: 'bitlabs',
+        transactionId: String(transactionId),
+        rawData: req.query,
+        fallbackAmount: amount,
+      });
+
+      if (reverseResult.ignored) {
+        return res.status(200).json({
+          message: 'BitLabs reverse ignored',
+          reason: reverseResult.reason,
+          transactionId,
+        });
+      }
+
+      return res.json({
+        success: true,
+        provider: 'bitlabs',
+        reversed: reverseResult.reversed,
+        transactionId,
+        userId,
+        type,
+      });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        error: 'Invalid BitLabs reward amount',
+        received: req.query,
+      });
+    }
+
+    const result = await creditReward({
+      client,
+      userId,
+      provider: 'bitlabs',
+      transactionId: String(transactionId),
+      amount,
+      status: 'completed',
+      rawData: {
+        ...req.query,
+        parsed: {
+          usd,
+          type,
+        },
+      },
+      transactionType: 'survey_completion',
+      description: 'BITLABS survey completed',
+      referenceType: 'survey',
+    });
+
+    if (result.duplicate) {
+      return res.status(200).json({
+        message: 'Duplicate ignored',
+        transactionId,
+      });
+    }
+
+    return res.json({
+      success: true,
+      credited: amount,
+      provider: 'bitlabs',
+      transactionId,
+      userId,
+      usd,
+      type,
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {}
+
+    console.error('BITLABS POSTBACK ERROR:', error);
+
+    return res.status(error.status || 500).json({
+      error: error.message || 'Failed to process BitLabs postback',
+    });
+  } finally {
+    client.release();
+  }
+});
+
 router.get('/:provider', postbackAuth, async (req, res) => {
   const client = await pool.connect();
 
@@ -262,66 +546,26 @@ router.get('/:provider', postbackAuth, async (req, res) => {
     const { provider, transactionId, userId, reward, status } = req.postback;
 
     if (status === 'reversed') {
-      await client.query('BEGIN');
+      const reverseResult = await reverseReward({
+        client,
+        provider,
+        transactionId,
+        rawData: req.query,
+        fallbackAmount: Number(reward),
+      });
 
-      const existing = await client.query(
-        'SELECT id, user_id, reward, status FROM offerwall_postbacks WHERE transaction_id = $1',
-        [transactionId]
-      );
-
-      if (existing.rows.length === 0) {
-        await client.query('ROLLBACK');
+      if (reverseResult.ignored) {
         return res.status(200).json({
-          message: 'Reverse ignored: original not found',
+          message:
+            reverseResult.reason === 'original_not_found'
+              ? 'Reverse ignored: original not found'
+              : 'Duplicate reverse ignored',
         });
       }
-
-      const existingPostback = existing.rows[0];
-
-      if (existingPostback.status === 'reversed') {
-        await client.query('ROLLBACK');
-        return res.status(200).json({
-          message: 'Duplicate reverse ignored',
-        });
-      }
-
-      const reverseAmount = Number(existingPostback.reward || reward);
-
-      await client.query(
-        `UPDATE offerwall_postbacks
-         SET status = $1, raw_data = $2
-         WHERE transaction_id = $3`,
-        ['reversed', JSON.stringify(req.query), transactionId]
-      );
-
-      await client.query(
-        `UPDATE users
-         SET balance = GREATEST(COALESCE(balance, 0) - $1, 0),
-             total_earned = GREATEST(COALESCE(total_earned, 0) - $1, 0),
-             updated_at = NOW()
-         WHERE id = $2`,
-        [reverseAmount, existingPostback.user_id]
-      );
-
-      await client.query(
-        `INSERT INTO transactions
-         (user_id, type, amount, description, reference_type, external_transaction_id)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [
-          existingPostback.user_id,
-          'offer_reversal',
-          -reverseAmount,
-          `${provider.toUpperCase()} reward reversed`,
-          'offerwall',
-          transactionId,
-        ]
-      );
-
-      await client.query('COMMIT');
 
       return res.json({
         success: true,
-        reversed: reverseAmount,
+        reversed: reverseResult.reversed,
       });
     }
 
